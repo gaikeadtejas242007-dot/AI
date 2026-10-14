@@ -15,6 +15,7 @@
     <script defer src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
     <script defer src="./script.js"></script>
+    <script defer src="./fullstack.js"></script>
   </head>
   <body>
     <div class="app-shell">
@@ -27,6 +28,14 @@
         </a>
         <div class="topbar-right">
           <span class="privacy-pill"><span class="privacy-dot"></span> Camera stays on this device</span>
+          <div class="auth-block">
+            <button id="sign-in-button" class="auth-button auth-button-secondary" type="button">Sign in</button>
+            <button id="create-account-button" class="auth-button auth-button-primary" type="button">Create account</button>
+            <div id="user-menu" class="user-menu" hidden>
+              <span id="user-name" class="user-name">User</span>
+              <button id="sign-out-button" class="auth-button auth-button-secondary" type="button">Sign out</button>
+            </div>
+          </div>
           <nav class="main-nav" aria-label="Main navigation">
             <button class="nav-button active" type="button" data-page="live">Live monitor</button>
             <button class="nav-button" type="button" data-page="history">History <span id="history-nav-count" class="nav-count">0</span></button>
@@ -76,7 +85,15 @@
                   <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>
                   <span>Stop</span>
                 </button>
-                <span class="camera-control-note" id="camera-control-note">No recording · No video leaves this device</span>
+                <button id="screen-record-button" class="button button-secondary" type="button" title="Record this app tab for a walkthrough">
+                  <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="6.5" stroke="currentColor" stroke-width="1.5"/><circle cx="10" cy="10" r="3" fill="#d5574d"/></svg>
+                  <span>Record screen</span>
+                </button>
+                <button id="screen-stop-button" class="button button-secondary" type="button" hidden>
+                  <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>
+                  <span>Stop recording</span>
+                </button>
+                <span class="camera-control-note" id="camera-control-note">Bird clips saved locally · max 2 min</span>
               </div>
               <div class="detection-banner" id="detection-banner" aria-live="polite">
                 <span class="detection-symbol" id="detection-symbol" aria-hidden="true">
@@ -84,6 +101,25 @@
                 </span>
                 <div class="detection-copy"><strong id="detection-status">Waiting to start</strong><span id="detection-detail">Allow camera access to begin local AI detection.</span></div>
                 <div class="detection-live-count"><strong id="live-bird-count">—</strong><span>birds</span></div>
+              </div>
+              <div id="position-panel" class="position-panel" aria-live="polite">
+                <div class="position-header">
+                  <span>Bird map</span>
+                  <strong>cm</strong>
+                </div>
+                <div class="position-map" aria-hidden="true">
+                  <div class="position-map-inner">
+                    <span class="map-label map-label-top">N</span>
+                    <span class="map-label map-label-right">E</span>
+                    <span class="map-label map-label-bottom">S</span>
+                    <span class="map-label map-label-left">W</span>
+                    <div id="position-dot" class="position-dot"></div>
+                  </div>
+                </div>
+                <div class="position-readout">
+                  <span>X <strong id="position-x">0.0 cm</strong></span>
+                  <span>Y <strong id="position-y">0.0 cm</strong></span>
+                </div>
               </div>
               <div class="live-metrics">
                 <div class="metric"><span class="metric-label">Best confidence</span><strong id="live-confidence">—</strong></div>
@@ -167,7 +203,7 @@
                 <span class="privacy-shield" aria-hidden="true">
                   <svg viewBox="0 0 20 20" fill="none"><path d="M10 2.5 16 5v4.6c0 3.8-2.4 6.6-6 7.9-3.6-1.3-6-4.1-6-7.9V5l6-2.5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="m7.5 9.8 1.6 1.6 3.5-3.6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 </span>
-                <p><strong>Private by design</strong><span>Detection runs in your browser. Video is never recorded or sent to a server.</span></p>
+                <p><strong>Private by design</strong><span>Detection runs in your browser. Bird photos and clips stay on this device; screen recordings download only when you choose to record.</span></p>
               </div>
             </aside>
           </div>
@@ -179,7 +215,7 @@
             <div>
               <p class="eyebrow">YOUR LOCAL RECORD</p>
               <h1 id="history-heading">Detection history</h1>
-              <p class="heading-subtitle">Session summaries stay in this browser. Camera footage is never stored.</p>
+              <p class="heading-subtitle">Bird photos, detection clips, and session summaries stay in this browser. Clips are limited to two minutes per visit.</p>
             </div>
             <button id="clear-history" class="button button-danger" type="button" disabled>
               <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M3.5 5.5h13M8 8.5v6m4-6v6M5 5.5l.7 11h8.6l.7-11M7.5 5.5v-2h5v2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -199,21 +235,98 @@
             </div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Date &amp; time</th><th>Birds</th><th>Duration</th><th>Confidence</th><th>Audio</th></tr></thead>
+                <thead><tr><th>Date &amp; time</th><th>Birds</th><th>Duration</th><th>Confidence</th><th>Audio</th><th>Video</th><th>Photo</th></tr></thead>
                 <tbody id="history-rows"></tbody>
               </table>
               <div id="history-empty" class="empty-history">
                 <span class="empty-history-icon" aria-hidden="true"><svg viewBox="0 0 40 40" fill="none"><path d="M6 24c5.1-.2 8.4-2.4 10.8-7.4 1.9 3.9 5.2 5.8 9.6 6.1-2.9 5.5-7.9 8-14.3 7l-4.8 2.1 1.4-4.2A14 14 0 0 1 6 24Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></span>
-                <strong>No detections yet</strong><span>Your bird detection sessions will show up here.</span>
+                <strong>No detections yet</strong><span>Bird photos and clips are saved after a detection session ends. Photos are captured only when a bird is detected.</span>
                 <button class="text-link" type="button" data-page="live">Go to live monitor <span aria-hidden="true">→</span></button>
               </div>
             </div>
-            <p class="history-footnote"><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2 13 4v3.8c0 3.2-2 5.5-5 6.6-3-1.1-5-3.4-5-6.6V4l5-2Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg> Stored on this device only. Detection events include summaries, never photos or video.</p>
+            <p class="history-footnote"><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2 13 4v3.8c0 3.2-2 5.5-5 6.6-3-1.1-5-3.4-5-6.6V4l5-2Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg> Bird photos and clips stay on this device. Clips record only during detections and stop at two minutes per visit.</p>
           </section>
           <footer class="page-footer"><span>Perch runs locally in this browser.</span><span>History is saved in this browser on this device.</span></footer>
         </section>
       </main>
     </div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <div id="history-video-modal" class="clip-modal" hidden>
+      <div class="clip-backdrop" data-close-history-video="true"></div>
+      <section class="clip-dialog" role="dialog" aria-modal="true" aria-labelledby="history-video-title">
+        <div class="clip-heading">
+          <h2 id="history-video-title">Bird detection clip</h2>
+          <button id="close-history-video" class="close-auth" type="button" aria-label="Close video">×</button>
+        </div>
+        <video id="history-video" controls playsinline></video>
+      </section>
+    </div>
+
+    <div id="history-photo-modal" class="clip-modal" hidden>
+      <div class="clip-backdrop" data-close-history-photo="true"></div>
+      <section class="clip-dialog photo-dialog" role="dialog" aria-modal="true" aria-labelledby="history-photo-title">
+        <div class="clip-heading">
+          <h2 id="history-photo-title">Detected bird</h2>
+          <button id="close-history-photo" class="close-auth" type="button" aria-label="Close photo">×</button>
+        </div>
+        <img id="history-photo" alt="Bird captured during detection" />
+      </section>
+    </div>
+
+    <div id="auth-modal" class="auth-modal" hidden>
+      <div class="auth-backdrop" data-close-auth="true"></div>
+      <div class="auth-panel" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+        <div class="auth-header">
+          <div>
+            <p class="auth-kicker">ACCOUNT</p>
+            <h3 id="auth-title">Access your account</h3>
+          </div>
+          <button id="close-auth-modal" class="close-auth" type="button" aria-label="Close account panel">×</button>
+        </div>
+
+        <div class="auth-tabs">
+          <button id="auth-tab-signin" class="auth-tab active" type="button" data-auth-tab="signin">Sign in</button>
+          <button id="auth-tab-create" class="auth-tab" type="button" data-auth-tab="create">Create account</button>
+        </div>
+
+        
+        <form id="sign-in-form" class="auth-form active" novalidate>
+          <label>
+            <span>Email</span>
+            <input type="email" id="signin-email" name="email" placeholder="you@example.com" required />
+          </label>
+          <label>
+            <span>Password</span>
+            <input type="password" id="signin-password" name="password" placeholder="Your password" required />
+          </label>
+          <button class="button button-primary auth-submit" type="submit">Sign in</button>
+        </form>
+
+        <form id="create-account-form" class="auth-form" novalidate>
+          <label>
+            <span>Full name</span>
+            <input type="text" id="signup-name" name="fullName" placeholder="Your full name" required />
+          </label>
+          <label>
+            <span>Email</span>
+            <input type="email" id="signup-email" name="email" placeholder="you@example.com" required />
+          </label>
+          <label>
+            <span>Phone number</span>
+            <input type="tel" id="signup-phone" name="phone" placeholder="Optional" />
+          </label>
+          <label>
+            <span>Password</span>
+            <input type="password" id="signup-password" name="password" placeholder="Choose a password" required minlength="6" />
+          </label>
+          <label>
+            <span>Confirm password</span>
+            <input type="password" id="signup-confirm-password" name="confirmPassword" placeholder="Confirm your password" required minlength="6" />
+          </label>
+          <button class="button button-primary auth-submit" type="submit">Create account</button>
+        </form>
+      </div>
+    </div>
   </body>
 </html>

@@ -8,6 +8,8 @@
   const ui = {
     start: $("start-button"),
     stop: $("stop-button"),
+    screenRecord: $("screen-record-button"),
+    screenStop: $("screen-stop-button"),
     camera: $("camera-feed"),
     canvas: $("detection-canvas"),
     stage: $("camera-stage"),
@@ -53,7 +55,36 @@
     historyNavCount: $("history-nav-count"),
     clearHistory: $("clear-history"),
     toast: $("toast"),
+    positionPanel: $("position-panel"),
+    positionDot: $("position-dot"),
+    positionX: $("position-x"),
+    positionY: $("position-y"),
+    signInButton: $("sign-in-button"),
+    createAccountButton: $("create-account-button"),
+    userMenu: $("user-menu"),
+    userName: $("user-name"),
+    signOutButton: $("sign-out-button"),
+    authModal: $("auth-modal"),
+    authTabSignin: $("auth-tab-signin"),
+    authTabCreate: $("auth-tab-create"),
+    signInForm: $("sign-in-form"),
+    createAccountForm: $("create-account-form"),
+    closeAuthModal: $("close-auth-modal"),
+    historyVideoModal: $("history-video-modal"),
+    historyVideo: $("history-video"),
+    closeHistoryVideo: $("close-history-video"),
+    historyPhotoModal: $("history-photo-modal"),
+    historyPhoto: $("history-photo"),
+    closeHistoryPhoto: $("close-history-photo"),
   };
+
+  const AUTH_ACCOUNTS_KEY = "perch.auth.accounts.v1";
+  const AUTH_SESSION_KEY = "perch.auth.session.v1";
+  const CLIPS_DB_NAME = "perch.detection-clips.v1";
+  const CLIPS_STORE_NAME = "clips";
+  const PHOTOS_STORE_NAME = "photos";
+  const USER_FRAME_WIDTH_CM = 120;
+  const USER_FRAME_HEIGHT_CM = 80;
 
   let model = null;
   let modelPromise = null;
@@ -69,10 +100,24 @@
   let audioUnlocked = false;
   let currentAudioName = "";
   let audioObjectUrl = "";
+  let historyVideoUrl = "";
+  let historyPhotoUrl = "";
+  let clipsDatabasePromise = null;
+  let activeClipRecorder = null;
+  let activeClipChunks = [];
+  let activeClipSessionId = "";
+  let activeClipTimeout = null;
+  let clipSupportNoticeShown = false;
+  let screenRecorder = null;
+  let screenRecordingStream = null;
+  let screenRecordingChunks = [];
+  let screenRecordingTimeout = null;
   let toastTimer = null;
+  let previousMotionFrame = null;
+  let lastDetectionAt = 0;
   let history = loadHistory();
 
-  const defaults = { threshold: 60, persistence: 1.5, interval: 450, volume: 65, auto: false };
+  const defaults = { threshold: 35, persistence: 1.5, interval: 450, volume: 65, auto: false };
   const settings = loadSettings();
 
   function loadHistory() {
@@ -109,6 +154,287 @@
     }
   }
 
+  function openClipsDatabase() {
+    if (!window.indexedDB) return Promise.reject(new Error("Local video storage is unavailable."));
+    if (!clipsDatabasePromise) {
+      clipsDatabasePromise = new Promise((resolve, reject) => {
+        const request = window.indexedDB.open(CLIPS_DB_NAME, 2);
+        request.onupgradeneeded = () => {
+          if (!request.result.objectStoreNames.contains(CLIPS_STORE_NAME)) {
+            request.result.createObjectStore(CLIPS_STORE_NAME, { keyPath: "id" });
+          }
+          if (!request.result.objectStoreNames.contains(PHOTOS_STORE_NAME)) {
+            request.result.createObjectStore(PHOTOS_STORE_NAME, { keyPath: "id" });
+          }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error("Could not open local video storage."));
+      });
+    }
+    return clipsDatabasePromise;
+  }
+
+  async function saveDetectionClip(id, blob) {
+    try {
+      const database = await openClipsDatabase();
+      await new Promise((resolve, reject) => {
+        const transaction = database.transaction(CLIPS_STORE_NAME, "readwrite");
+        transaction.objectStore(CLIPS_STORE_NAME).put({ id, blob, type: blob.type });
+        transaction.oncomplete = resolve;
+        transaction.onerror = () => reject(transaction.error || new Error("Could not save the detection clip."));
+        transaction.onabort = () => reject(transaction.error || new Error("Clip storage was interrupted."));
+      });
+      const event = history.find((entry) => entry.id === id);
+      if (event) {
+        event.videoAvailable = true;
+        saveHistory();
+        refreshHistory();
+      }
+    } catch (error) {
+      console.error("Could not save bird detection clip:", error);
+      showToast("Could not save this clip in browser storage.");
+    }
+  }
+
+  async function getDetectionClip(id) {
+    const database = await openClipsDatabase();
+    return new Promise((resolve, reject) => {
+      const request = database.transaction(CLIPS_STORE_NAME, "readonly").objectStore(CLIPS_STORE_NAME).get(id);
+      request.onsuccess = () => resolve(request.result ? request.result.blob : null);
+      request.onerror = () => reject(request.error || new Error("Could not load the detection clip."));
+    });
+  }
+
+  async function saveDetectionPhoto(id, blob) {
+    try {
+      const database = await openClipsDatabase();
+      await new Promise((resolve, reject) => {
+        const transaction = database.transaction(PHOTOS_STORE_NAME, "readwrite");
+        transaction.objectStore(PHOTOS_STORE_NAME).put({ id, blob, type: blob.type });
+        transaction.oncomplete = resolve;
+        transaction.onerror = () => reject(transaction.error || new Error("Could not save the bird photo."));
+        transaction.onabort = () => reject(transaction.error || new Error("Photo storage was interrupted."));
+      });
+      const event = history.find((entry) => entry.id === id);
+      if (event) {
+        event.photoAvailable = true;
+        saveHistory();
+      }
+      if (session && session.id === id) session.photoAvailable = true;
+      refreshHistory();
+    } catch (error) {
+      console.error("Could not save bird detection photo:", error);
+      showToast("Could not save the bird photo in browser storage.");
+    }
+  }
+
+  async function getDetectionPhoto(id) {
+    const database = await openClipsDatabase();
+    return new Promise((resolve, reject) => {
+      const request = database.transaction(PHOTOS_STORE_NAME, "readonly").objectStore(PHOTOS_STORE_NAME).get(id);
+      request.onsuccess = () => resolve(request.result ? request.result.blob : null);
+      request.onerror = () => reject(request.error || new Error("Could not load the bird photo."));
+    });
+  }
+
+  async function showDetectionPhoto(id) {
+    try {
+      const photo = await getDetectionPhoto(id);
+      if (!photo) {
+        showToast("No saved photo is available for this detection.");
+        return;
+      }
+      if (historyPhotoUrl) URL.revokeObjectURL(historyPhotoUrl);
+      historyPhotoUrl = URL.createObjectURL(photo);
+      ui.historyPhoto.src = historyPhotoUrl;
+      ui.historyPhotoModal.hidden = false;
+    } catch (error) {
+      console.error("Could not open bird detection photo:", error);
+      showToast("Could not open this bird photo.");
+    }
+  }
+
+  function closeDetectionPhoto() {
+    ui.historyPhoto.removeAttribute("src");
+    ui.historyPhotoModal.hidden = true;
+    if (historyPhotoUrl) URL.revokeObjectURL(historyPhotoUrl);
+    historyPhotoUrl = "";
+  }
+
+  function captureBirdPhoto(bird) {
+    if (!bird || !ui.camera.videoWidth || !ui.camera.videoHeight) return Promise.resolve(null);
+    const [birdX, birdY, birdWidth, birdHeight] = bird.bbox;
+    const paddingX = birdWidth * 0.2;
+    const paddingY = birdHeight * 0.2;
+    const sourceX = Math.max(0, birdX - paddingX);
+    const sourceY = Math.max(0, birdY - paddingY);
+    const sourceRight = Math.min(ui.camera.videoWidth, birdX + birdWidth + paddingX);
+    const sourceBottom = Math.min(ui.camera.videoHeight, birdY + birdHeight + paddingY);
+    const sourceWidth = sourceRight - sourceX;
+    const sourceHeight = sourceBottom - sourceY;
+    if (sourceWidth <= 0 || sourceHeight <= 0) return Promise.resolve(null);
+
+    const maxDimension = 1200;
+    const scale = Math.min(1, maxDimension / Math.max(sourceWidth, sourceHeight));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+    canvas.height = Math.max(1, Math.round(sourceHeight * scale));
+    const context = canvas.getContext("2d");
+    context.drawImage(ui.camera, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
+    return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.88));
+  }
+
+  async function clearDetectionClips() {
+    const database = await openClipsDatabase();
+    return new Promise((resolve, reject) => {
+      const transaction = database.transaction([CLIPS_STORE_NAME, PHOTOS_STORE_NAME], "readwrite");
+      transaction.objectStore(CLIPS_STORE_NAME).clear();
+      transaction.objectStore(PHOTOS_STORE_NAME).clear();
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error("Could not clear saved clips."));
+      transaction.onabort = () => reject(transaction.error || new Error("Clip cleanup was interrupted."));
+    });
+  }
+
+  function getSupportedVideoMimeType() {
+    const types = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm", "video/mp4"];
+    return typeof MediaRecorder.isTypeSupported === "function"
+      ? types.find((type) => MediaRecorder.isTypeSupported(type)) || ""
+      : "";
+  }
+
+  function startClipRecording(sessionId) {
+    if (!cameraStream || activeClipRecorder) return;
+    if (!window.MediaRecorder) {
+      if (!clipSupportNoticeShown) showToast("This browser does not support video clips; bird detection will continue.");
+      clipSupportNoticeShown = true;
+      return;
+    }
+    try {
+      const mimeType = getSupportedVideoMimeType();
+      const recorder = new MediaRecorder(cameraStream, mimeType ? { mimeType } : undefined);
+      activeClipRecorder = recorder;
+      activeClipChunks = [];
+      activeClipSessionId = sessionId;
+      recorder.addEventListener("dataavailable", (event) => {
+        if (event.data && event.data.size) activeClipChunks.push(event.data);
+      });
+      recorder.addEventListener("stop", () => {
+        const clipBlob = new Blob(activeClipChunks, { type: recorder.mimeType || "video/webm" });
+        const clipId = activeClipSessionId;
+        activeClipRecorder = null;
+        activeClipChunks = [];
+        activeClipSessionId = "";
+        clearTimeout(activeClipTimeout);
+        activeClipTimeout = null;
+        if (clipBlob.size) void saveDetectionClip(clipId, clipBlob);
+      }, { once: true });
+      recorder.start(1000);
+      activeClipTimeout = setTimeout(() => stopClipRecording(sessionId), 119000);
+    } catch (error) {
+      console.error("Could not record bird detection clip:", error);
+      showToast("This browser could not record a detection clip.");
+    }
+  }
+
+  function stopClipRecording(sessionId) {
+    if (!activeClipRecorder || activeClipSessionId !== sessionId) return;
+    clearTimeout(activeClipTimeout);
+    activeClipTimeout = null;
+    if (activeClipRecorder.state !== "inactive") activeClipRecorder.stop();
+  }
+
+  async function startScreenRecording() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia || !window.MediaRecorder) {
+      showToast("This browser does not support screen recording.");
+      return;
+    }
+    try {
+      screenRecordingStream = await navigator.mediaDevices.getDisplayMedia({ video: { displaySurface: "browser" }, audio: false });
+      const mimeType = getSupportedVideoMimeType();
+      screenRecorder = new MediaRecorder(screenRecordingStream, mimeType ? { mimeType } : undefined);
+      screenRecordingChunks = [];
+      screenRecorder.addEventListener("dataavailable", (event) => {
+        if (event.data && event.data.size) screenRecordingChunks.push(event.data);
+      });
+      screenRecorder.addEventListener("stop", () => {
+        const recording = new Blob(screenRecordingChunks, { type: screenRecorder.mimeType || "video/webm" });
+        const extension = recording.type.includes("mp4") ? "mp4" : "webm";
+        screenRecordingStream.getTracks().forEach((track) => track.stop());
+        screenRecordingStream = null;
+        screenRecorder = null;
+        screenRecordingChunks = [];
+        clearTimeout(screenRecordingTimeout);
+        screenRecordingTimeout = null;
+        ui.screenRecord.hidden = false;
+        ui.screenStop.hidden = true;
+        if (!recording.size) {
+          showToast("The screen recording was empty. Try recording again.");
+          return;
+        }
+        const url = URL.createObjectURL(recording);
+        const download = document.createElement("a");
+        download.href = url;
+        download.download = `perch-detection-demo-${Date.now()}.${extension}`;
+        download.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        showToast("Screen video downloaded to your device.");
+      }, { once: true });
+      screenRecordingStream.getVideoTracks()[0].addEventListener("ended", stopScreenRecording, { once: true });
+      screenRecorder.start(1000);
+      ui.screenRecord.hidden = true;
+      ui.screenStop.hidden = false;
+      screenRecordingTimeout = setTimeout(stopScreenRecording, 119000);
+      showToast("Screen recording started. Show bird detection on screen, then stop recording.");
+    } catch (error) {
+      if (screenRecordingStream) screenRecordingStream.getTracks().forEach((track) => track.stop());
+      screenRecordingStream = null;
+      screenRecorder = null;
+      if (error && error.name === "NotAllowedError") {
+        showToast("Screen recording was canceled. Choose this browser tab to record the app.");
+      } else if (error && error.name === "NotSupportedError") {
+        showToast("This browser cannot capture the screen. Open Perch in Edge or Chrome, or use Windows Snipping Tool.");
+      } else {
+        console.error("Could not start screen recording:", error);
+        showToast("Could not start screen recording in this browser.");
+      }
+    }
+  }
+
+  function stopScreenRecording() {
+    if (!screenRecorder || screenRecorder.state === "inactive") return;
+    clearTimeout(screenRecordingTimeout);
+    screenRecordingTimeout = null;
+    screenRecorder.stop();
+  }
+
+  async function playDetectionClip(id) {
+    try {
+      const clip = await getDetectionClip(id);
+      if (!clip) {
+        showToast("No saved video clip is available for this detection.");
+        return;
+      }
+      if (historyVideoUrl) URL.revokeObjectURL(historyVideoUrl);
+      historyVideoUrl = URL.createObjectURL(clip);
+      ui.historyVideo.src = historyVideoUrl;
+      ui.historyVideoModal.hidden = false;
+      ui.historyVideo.play().catch(() => showToast("Press play on the video to start playback."));
+    } catch (error) {
+      console.error("Could not play bird detection clip:", error);
+      showToast("Could not open this video clip.");
+    }
+  }
+
+  function closeDetectionClip() {
+    ui.historyVideo.pause();
+    ui.historyVideo.removeAttribute("src");
+    ui.historyVideo.load();
+    ui.historyVideoModal.hidden = true;
+    if (historyVideoUrl) URL.revokeObjectURL(historyVideoUrl);
+    historyVideoUrl = "";
+  }
+
   function showToast(message) {
     ui.toast.textContent = message;
     ui.toast.classList.add("visible");
@@ -120,6 +446,154 @@
     ui.modelPill.classList.remove("loading", "ready", "error");
     if (state) ui.modelPill.classList.add(state);
     ui.modelLabel.textContent = label;
+  }
+
+  function loadAccounts() {
+    try {
+      const accounts = JSON.parse(localStorage.getItem(AUTH_ACCOUNTS_KEY) || "[]");
+      return Array.isArray(accounts) ? accounts : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveAccounts(accounts) {
+    localStorage.setItem(AUTH_ACCOUNTS_KEY, JSON.stringify(accounts));
+  }
+
+  function loadSession() {
+    try {
+      return JSON.parse(localStorage.getItem(AUTH_SESSION_KEY) || "null");
+    } catch {
+      return null;
+    }
+  }
+
+  function saveSession(user) {
+    if (!user) {
+      localStorage.removeItem(AUTH_SESSION_KEY);
+      return;
+    }
+    localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(user));
+  }
+
+  function setAuthTab(tabName) {
+    const isSignIn = tabName === "signin";
+    ui.authTabSignin.classList.toggle("active", isSignIn);
+    ui.authTabCreate.classList.toggle("active", !isSignIn);
+    ui.signInForm.classList.toggle("active", isSignIn);
+    ui.createAccountForm.classList.toggle("active", !isSignIn);
+  }
+
+  function openAuthModal(tabName = "signin") {
+    setAuthTab(tabName);
+    ui.authModal.hidden = false;
+  }
+
+  function closeAuthModal() {
+    ui.authModal.hidden = true;
+  }
+
+  function updateAuthUI() {
+    const session = loadSession();
+    if (session && session.email) {
+      ui.signInButton.hidden = true;
+      ui.createAccountButton.hidden = true;
+      ui.userMenu.hidden = false;
+      ui.userName.textContent = session.fullName || session.email.split("@")[0];
+    } else {
+      ui.signInButton.hidden = false;
+      ui.createAccountButton.hidden = false;
+      ui.userMenu.hidden = true;
+    }
+  }
+
+  function ensureValidEmail(email) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
+  }
+
+  function handleCreateAccount(event) {
+    event.preventDefault();
+    const accounts = loadAccounts();
+    const form = event.currentTarget;
+    const fullName = form.querySelector("#signup-name").value.trim();
+    const email = form.querySelector("#signup-email").value.trim();
+    const phone = form.querySelector("#signup-phone").value.trim();
+    const password = form.querySelector("#signup-password").value;
+    const confirmPassword = form.querySelector("#signup-confirm-password").value;
+
+    if (!fullName || !email || !password || !confirmPassword) {
+      showToast("Please fill in all required fields.");
+      return;
+    }
+    if (!ensureValidEmail(email)) {
+      showToast("Enter a valid email address.");
+      return;
+    }
+    if (password.length < 6) {
+      showToast("Password must be at least 6 characters.");
+      return;
+    }
+    if (password !== confirmPassword) {
+      showToast("Passwords do not match.");
+      return;
+    }
+    const exists = accounts.some((account) => account.email.toLowerCase() === email.toLowerCase());
+    if (exists) {
+      showToast("An account with this email already exists.");
+      return;
+    }
+
+    const newUser = {
+      id: makeId(),
+      fullName,
+      email: email.toLowerCase(),
+      phone: phone || "",
+      password,
+      createdAt: new Date().toISOString(),
+    };
+    accounts.push(newUser);
+    saveAccounts(accounts);
+    saveSession({ id: newUser.id, email: newUser.email, fullName: newUser.fullName });
+    updateAuthUI();
+    form.reset();
+    closeAuthModal();
+    showToast("Account created successfully.");
+  }
+
+  function handleSignIn(event) {
+    event.preventDefault();
+    const accounts = loadAccounts();
+    const form = event.currentTarget;
+    const email = form.querySelector("#signin-email").value.trim().toLowerCase();
+    const password = form.querySelector("#signin-password").value;
+
+    if (!email || !password) {
+      showToast("Email and password are required.");
+      return;
+    }
+    if (!ensureValidEmail(email)) {
+      showToast("Enter a valid email address.");
+      return;
+    }
+
+    const account = accounts.find((item) => item.email.toLowerCase() === email && item.password === password);
+    if (!account) {
+      showToast("No account matches that email and password.");
+      return;
+    }
+
+    saveSession({ id: account.id, email: account.email, fullName: account.fullName });
+    updateAuthUI();
+    form.reset();
+    closeAuthModal();
+    showToast(`Welcome back, ${account.fullName}.`);
+  }
+
+  function handleSignOut() {
+    saveSession(null);
+    updateAuthUI();
+    showToast("Signed out successfully.");
   }
 
   function ensureModel() {
@@ -264,7 +738,23 @@
       audio.className = "audio-cell";
       audio.title = event.audioUsed || "No audio";
       audio.textContent = event.audioUsed || "No audio";
-      row.append(when, birds, duration, confidence, audio);
+      const video = document.createElement("td");
+      const playClip = document.createElement("button");
+      playClip.className = "clip-button";
+      playClip.type = "button";
+      playClip.textContent = event.videoAvailable ? "Play clip" : "No clip";
+      playClip.disabled = !event.videoAvailable;
+      playClip.dataset.clipId = event.id;
+      video.append(playClip);
+      const photo = document.createElement("td");
+      const viewPhoto = document.createElement("button");
+      viewPhoto.className = "clip-button";
+      viewPhoto.type = "button";
+      viewPhoto.textContent = event.photoAvailable ? "View photo" : "No photo";
+      viewPhoto.disabled = !event.photoAvailable;
+      viewPhoto.dataset.photoId = event.id;
+      photo.append(viewPhoto);
+      row.append(when, birds, duration, confidence, audio, video, photo);
       ui.historyRows.append(row);
     }
   }
@@ -278,7 +768,7 @@
     }
   }
 
-  function startSession(confidence, birdCount, timestamp) {
+  function startSession(confidence, birdCount, timestamp, primaryBird) {
     session = {
       id: makeId(),
       startedAt: new Date(timestamp).toISOString(),
@@ -289,14 +779,33 @@
       confidenceTotal: confidence,
       confidenceSamples: 1,
       audioUsed: currentAudioName || "",
+      photoConfidence: confidence,
+      photoCaptureVersion: 0,
+      photoAvailable: false,
     };
     lastSeenAt = timestamp;
+    startClipRecording(session.id);
+    saveBirdSnapshot(session, primaryBird);
     refreshHistory();
+  }
+
+  function saveBirdSnapshot(sessionData, bird) {
+    const captureVersion = ++sessionData.photoCaptureVersion;
+    captureBirdPhoto(bird).then((photo) => {
+      if (photo && sessionData.photoCaptureVersion === captureVersion) {
+        void saveDetectionPhoto(sessionData.id, photo);
+      }
+    });
   }
 
   function recordBirds(birds, timestamp) {
     const best = Math.max(...birds.map((prediction) => prediction.score));
-    if (!session) startSession(best, birds.length, timestamp);
+    if (!session) startSession(best, birds.length, timestamp, birds.reduce((top, bird) => bird.score > top.score ? bird : top));
+    if (best > session.photoConfidence) {
+      session.photoConfidence = best;
+      const bestBird = birds.reduce((top, bird) => bird.score > top.score ? bird : top);
+      saveBirdSnapshot(session, bestBird);
+    }
     session.lastSeenAt = timestamp;
     session.maxBirds = Math.max(session.maxBirds, birds.length);
     session.maxConfidence = Math.max(session.maxConfidence, best);
@@ -311,6 +820,7 @@
 
   function finishSession() {
     if (!session) return;
+    stopClipRecording(session.id);
     const endedAtMs = Math.max(session.startMs, session.lastSeenAt);
     const event = {
       id: session.id,
@@ -322,6 +832,8 @@
       maxConfidence: session.maxConfidence,
       averageConfidence: session.confidenceTotal / Math.max(1, session.confidenceSamples),
       audioUsed: session.audioUsed || "",
+      videoAvailable: false,
+      photoAvailable: session.photoAvailable,
     };
     history.unshift(event);
     history = history.slice(0, 500);
@@ -344,6 +856,113 @@
     context.clearRect(0, 0, ui.canvas.width, ui.canvas.height);
   }
 
+  function analyzeMotion(frameVideo) {
+    const width = 160;
+    const height = 90;
+    const tmpCanvas = document.createElement("canvas");
+    const tmpContext = tmpCanvas.getContext("2d", { willReadFrequently: true });
+    tmpCanvas.width = width;
+    tmpCanvas.height = height;
+    tmpContext.drawImage(frameVideo, 0, 0, width, height);
+    const frameData = tmpContext.getImageData(0, 0, width, height).data;
+
+    if (!previousMotionFrame) {
+      previousMotionFrame = frameData.slice();
+      return 0;
+    }
+
+    let changedPixels = 0;
+    const previousFrame = previousMotionFrame;
+
+    for (let i = 0; i < frameData.length; i += 4) {
+      const red = frameData[i];
+      const green = frameData[i + 1];
+      const blue = frameData[i + 2];
+      const previousRed = previousFrame[i];
+      const previousGreen = previousFrame[i + 1];
+      const previousBlue = previousFrame[i + 2];
+      const lum = (red + green + blue) / 3;
+      const previousLum = (previousRed + previousGreen + previousBlue) / 3;
+      const delta = Math.abs(lum - previousLum);
+      if (delta > 22) changedPixels += 1;
+    }
+
+    previousMotionFrame = frameData.slice();
+    const motionPercent = (changedPixels / (width * height)) * 100;
+    return motionPercent;
+  }
+
+  function getDetectionState(predictions) {
+    const birdPredictions = predictions.filter((prediction) => prediction.class && prediction.class.toLowerCase() === "bird" && (prediction.score || 0) >= settings.threshold / 100);
+    const birdCount = birdPredictions.length;
+    const topBirdScore = birdPredictions.reduce((max, prediction) => Math.max(max, prediction.score || 0), 0);
+
+    return {
+      hasBird: birdCount > 0,
+      birdCount,
+      topBirdScore,
+    };
+  }
+
+  function resetBirdPosition() {
+    ui.positionPanel.classList.remove("active");
+    ui.positionDot.style.left = "50%";
+    ui.positionDot.style.top = "50%";
+    ui.positionX.textContent = "0.0 cm";
+    ui.positionY.textContent = "0.0 cm";
+    const existingDots = ui.positionPanel.querySelectorAll(".position-dot-multi");
+    existingDots.forEach((dot) => dot.remove());
+  }
+
+  function updateBirdPosition(birds) {
+    const existingDots = ui.positionPanel.querySelectorAll(".position-dot-multi");
+    existingDots.forEach((dot) => dot.remove());
+
+    if (!birds || !birds.length) {
+      resetBirdPosition();
+      return;
+    }
+
+    const videoWidth = ui.camera.videoWidth || 1280;
+    const videoHeight = ui.camera.videoHeight || 720;
+    const primaryBird = birds[0];
+
+    birds.forEach((bird, index) => {
+      const [x, y, width, height] = bird.bbox;
+      const centerX = x + width / 2;
+      const centerY = y + height / 2;
+      const xPercent = (centerX / videoWidth) * 100;
+      const yPercent = (centerY / videoHeight) * 100;
+      const xCm = ((centerX / videoWidth) * USER_FRAME_WIDTH_CM).toFixed(1);
+      const yCm = ((centerY / videoHeight) * USER_FRAME_HEIGHT_CM).toFixed(1);
+
+      const dot = document.createElement("div");
+      dot.className = "position-dot-multi";
+      dot.style.left = `${clamp(xPercent, 0, 100)}%`;
+      dot.style.top = `${clamp(yPercent, 0, 100)}%`;
+      dot.title = `Bird ${index + 1}: ${xCm} cm, ${yCm} cm`;
+      ui.positionPanel.appendChild(dot);
+
+      if (index === 0) {
+        ui.positionDot.style.left = `${clamp(xPercent, 0, 100)}%`;
+        ui.positionDot.style.top = `${clamp(yPercent, 0, 100)}%`;
+        ui.positionX.textContent = `${xCm} cm`;
+        ui.positionY.textContent = `${yCm} cm`;
+      }
+    });
+
+    ui.positionPanel.classList.add("active");
+    if (primaryBird && primaryBird.bbox) {
+      const [x, y, width, height] = primaryBird.bbox;
+      const centerX = x + width / 2;
+      const centerY = y + height / 2;
+      const xPercent = (centerX / videoWidth) * 100;
+      const yPercent = (centerY / videoHeight) * 100;
+      ui.positionDot.style.left = `${clamp(xPercent, 0, 100)}%`;
+      ui.positionDot.style.top = `${clamp(yPercent, 0, 100)}%`;
+    }
+  }
+
   function drawBirds(birds) {
     if (!ui.camera.videoWidth || !ui.camera.videoHeight) return;
     if (ui.canvas.width !== ui.camera.videoWidth || ui.canvas.height !== ui.camera.videoHeight) {
@@ -353,25 +972,55 @@
     }
     const context = ui.canvas.getContext("2d");
     context.clearRect(0, 0, ui.canvas.width, ui.canvas.height);
+
+    if (!birds.length) {
+      resetBirdPosition();
+      return;
+    }
+
     birds.forEach((bird, index) => {
       const [x, y, width, height] = bird.bbox;
-      const color = "#51d27a";
-      context.lineWidth = Math.max(2, ui.canvas.width / 540);
-      context.strokeStyle = color;
-      context.fillStyle = "rgba(18, 82, 43, 0.78)";
+      const score = Math.max(0, Math.min(1, Number(bird.score) || 0));
+      const scorePercent = Math.round(score * 100);
+      const ringWidth = Math.max(4, ui.canvas.width / 220);
+      const ringColor = "#7ef0a5";
+      const glowColor = "rgba(126, 240, 165, 0.35)";
+
+      context.save();
+      context.lineWidth = ringWidth;
+      context.strokeStyle = ringColor;
+      context.fillStyle = glowColor;
+      context.setLineDash([12, 10]);
+      context.shadowColor = "rgba(67, 255, 135, 0.95)";
+      context.shadowBlur = 26;
       context.strokeRect(x, y, width, height);
-      const label = `Bird ${Math.round(bird.score * 100)}%`;
-      context.font = `600 ${Math.max(13, ui.canvas.width / 48)}px "DM Sans", sans-serif`;
-      const labelWidth = context.measureText(label).width + 16;
-      const labelHeight = Math.max(25, ui.canvas.width / 28);
+      context.fillRect(x, y, width, height);
+      context.restore();
+
+      const label = `Bird ${scorePercent}%`;
+      context.font = `700 ${Math.max(13, ui.canvas.width / 48)}px "DM Sans", sans-serif`;
+      const labelPaddingX = 12;
+      const labelPaddingY = 8;
+      const labelWidth = context.measureText(label).width + labelPaddingX * 2;
+      const labelHeight = Math.max(24, ui.canvas.width / 28);
       const labelX = clamp(x, 0, ui.canvas.width - labelWidth);
-      const labelY = Math.max(0, y - labelHeight);
+      const labelY = Math.max(0, y - labelHeight - 10);
+
+      context.fillStyle = "rgba(15, 33, 18, 0.8)";
       context.fillRect(labelX, labelY, labelWidth, labelHeight);
-      context.fillStyle = "#fff";
+      context.strokeStyle = "rgba(126, 240, 165, 0.9)";
+      context.lineWidth = 1.5;
+      context.strokeRect(labelX, labelY, labelWidth, labelHeight);
+      context.fillStyle = "#eafff0";
       context.textBaseline = "middle";
-      context.fillText(label, labelX + 8, labelY + labelHeight / 2);
-      if (index === 0) currentConfidence = bird.score;
+      context.fillText(label, labelX + labelPaddingX, labelY + labelHeight / 2 + 1);
+
+      if (index === 0) {
+        currentConfidence = bird.score;
+      }
     });
+
+    updateBirdPosition(birds);
   }
 
   async function detectFrame() {
@@ -381,12 +1030,20 @@
     }
     try {
       const predictions = await model.detect(ui.camera);
-      const birds = predictions.filter((prediction) => prediction.class === "bird" && prediction.score >= settings.threshold / 100);
+      const birds = predictions.filter((prediction) => prediction.class && prediction.class.toLowerCase() === "bird" && (prediction.score || 0) >= settings.threshold / 100 );
+      const detectionState = getDetectionState(predictions);
+
       currentPredictions = birds;
       drawBirds(birds);
-      if (birds.length) {
-        recordBirds(birds, Date.now());
-        updateDetectorState(true, birds.length);
+
+      if (detectionState.hasBird) {
+        const detectionTime = Date.now();
+        const eventCount = detectionState.birdCount;
+        const confidence = detectionState.topBirdScore || 0;
+        lastDetectionAt = detectionTime;
+        recordBirds(birds, detectionTime);
+        ui.confidence.textContent = `${Math.round(confidence * 100)}%`;
+        updateDetectorState(true, eventCount);
       } else {
         ui.confidence.textContent = "—";
         updateDetectorState(false);
@@ -399,12 +1056,13 @@
       showCameraError("The model could not process the camera frame. Stop and start detection again; if this continues, reload the app.");
       return;
     }
+
     scheduleNextFrame();
   }
 
-  function scheduleNextFrame() {
+  function scheduleNextFrame(delay = settings.interval) {
     if (!isRunning) return;
-    frameTimer = setTimeout(detectFrame, settings.interval);
+    frameTimer = setTimeout(detectFrame, delay);
   }
 
   function getCameraErrorMessage(error) {
@@ -433,6 +1091,11 @@
 
   async function startDetection() {
     if (isRunning) return;
+    if (!loadSession()) {
+      openAuthModal("signin");
+      showToast("Please sign in or create an account before starting detection.");
+      return;
+    }
     ui.cameraError.hidden = true;
     ui.start.disabled = true;
     ui.start.querySelector("span").textContent = "Starting…";
@@ -590,11 +1253,45 @@
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
+  ui.signInButton.addEventListener("click", () => openAuthModal("signin"));
+  ui.createAccountButton.addEventListener("click", () => openAuthModal("create"));
+  ui.signOutButton.addEventListener("click", handleSignOut);
+  ui.closeAuthModal.addEventListener("click", closeAuthModal);
+
+  document.querySelectorAll("[data-close-auth='true']").forEach((element) => {
+    element.addEventListener("click", closeAuthModal);
+  });
+
+  document.querySelectorAll("[data-auth-tab]").forEach((tabButton) => {
+    tabButton.addEventListener("click", () => {
+      setAuthTab(tabButton.dataset.authTab === "create" ? "create" : "signin");
+    });
+  });
+
+  ui.signInForm.addEventListener("submit", handleSignIn);
+  ui.createAccountForm.addEventListener("submit", handleCreateAccount);
+  ui.historyRows.addEventListener("click", (event) => {
+    const playButton = event.target.closest("button[data-clip-id]");
+    if (playButton && !playButton.disabled) void playDetectionClip(playButton.dataset.clipId);
+    const photoButton = event.target.closest("button[data-photo-id]");
+    if (photoButton && !photoButton.disabled) void showDetectionPhoto(photoButton.dataset.photoId);
+  });
+  ui.closeHistoryVideo.addEventListener("click", closeDetectionClip);
+  document.querySelectorAll("[data-close-history-video='true']").forEach((element) => {
+    element.addEventListener("click", closeDetectionClip);
+  });
+  ui.closeHistoryPhoto.addEventListener("click", closeDetectionPhoto);
+  document.querySelectorAll("[data-close-history-photo='true']").forEach((element) => {
+    element.addEventListener("click", closeDetectionPhoto);
+  });
+
   document.querySelectorAll("[data-page]").forEach((button) => button.addEventListener("click", () => setPage(button.dataset.page)));
   document.querySelectorAll("[data-page-link]").forEach((link) => link.addEventListener("click", () => setPage(link.dataset.pageLink)));
 
   ui.start.addEventListener("click", startDetection);
   ui.stop.addEventListener("click", stopDetection);
+  ui.screenRecord.addEventListener("click", () => void startScreenRecording());
+  ui.screenStop.addEventListener("click", stopScreenRecording);
 
   ui.file.addEventListener("change", async () => {
     const file = ui.file.files && ui.file.files[0];
@@ -688,22 +1385,36 @@
     saveSettings();
   });
 
-  ui.clearHistory.addEventListener("click", () => {
+  ui.clearHistory.addEventListener("click", async () => {
     if (!history.length) return;
     const confirmed = window.confirm("Clear all saved detection history on this device? This cannot be undone.");
     if (!confirmed) return;
+    let clipsFailedToDelete = false;
+    try {
+      await clearDetectionClips();
+    } catch (error) {
+      console.error("Could not clear saved bird detection clips:", error);
+      clipsFailedToDelete = true;
+    }
     history = [];
     saveHistory();
     refreshHistory();
-    showToast("Detection history cleared from this device.");
+    showToast(clipsFailedToDelete
+      ? "History was cleared, but some saved video clips could not be deleted."
+      : "Detection history and video clips cleared from this device.");
   });
 
   window.addEventListener("beforeunload", () => {
     if (cameraStream) cameraStream.getTracks().forEach((track) => track.stop());
     if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
+    if (historyVideoUrl) URL.revokeObjectURL(historyVideoUrl);
+    if (historyPhotoUrl) URL.revokeObjectURL(historyPhotoUrl);
+    if (screenRecordingStream) screenRecordingStream.getTracks().forEach((track) => track.stop());
   });
 
   syncSettingsToUI();
   refreshHistory();
   setCameraState(false);
+  updateAuthUI();
+  setAuthTab("signin");
 })();
